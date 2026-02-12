@@ -56,7 +56,7 @@ class CoDec(EIC.CoDec):
         return compressed_img
 
     def compress(self, img, fn="/tmp/encoded"):
-        return self.compress_fn(ing, fn)
+        return self.compress_fn(img, fn)
     
     def decompress_fn(self, compressed_img, fn):
         logging.debug(f"trace compressed_img={compressed_img[:10]}")

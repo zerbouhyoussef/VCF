@@ -1,4 +1,4 @@
-'''III... coding: runs a 2D image codec to a sequence of images.'''
+'''III... coding: runs a 2D image codec for each image of a sequence.'''
 
 import sys
 import io
@@ -67,7 +67,7 @@ class CoDec(EVC.CoDec):
 
         '''
         logging.debug("trace")
-        fn = self.args.input
+        fn = self.args.original
         logging.info(f"Encoding {fn}")
         container = av.open(fn)
         img_counter = 0
@@ -76,6 +76,7 @@ class CoDec(EVC.CoDec):
             if __debug__:
                 self.total_input_size += packet.size
             for frame in packet.decode():
+                print(len(packet.decode()))
                 img = frame.to_image()
                 #img_fn = f"{EVC.ENCODE_OUTPUT_PREFIX}_%04d.png" % img_counter
                 img_fn = f"/tmp/original_%04d.png" % img_counter
@@ -100,7 +101,9 @@ class CoDec(EVC.CoDec):
                 self.total_output_size += O_bytes
                 img_counter += 1
                 #print("--------------->", img_counter, args.number_of_frames)
+                logging.info(f"img_counter = {img_counter} / {args.number_of_frames}")
                 if img_counter >= args.number_of_frames:
+                    print("Uf")
                     exit = True
                 img_fn = ""
                 img_fnNOPNG = ""

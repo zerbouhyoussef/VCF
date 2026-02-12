@@ -30,7 +30,7 @@ N_FRAMES = 3
 
 DEFAULT_TRANSFORM = "2D-DCT"
 
-class Video:
+class UNUSED_Video:
     '''A video is a sequence of files stored in "prefix".'''
 
     def __init__(self, N_frames, height, width, fn):
@@ -62,6 +62,7 @@ class CoDec:
         self.framerate = 30
 
     def bye(self):
+        return
         logging.debug("trace")
         #logging.info(f"Total {self.total_input_size} bytes read")
         #logging.info(f"Total {self.total_output_size} bytes written")

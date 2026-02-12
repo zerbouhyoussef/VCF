@@ -12,4 +12,6 @@ DCT2D @ git+https://github.com/vicente-gonzalez-ruiz/DCT2D@master#egg=DCT2D
 color_transforms @ git+https://github.com/vicente-gonzalez-ruiz/color_transforms@main#egg=color_transforms
 scalar_quantization @ git+https://github.com/vicente-gonzalez-ruiz/scalar_quantization@master#egg=scalar_quantization
 DWT2D @ git+https://github.com/vicente-gonzalez-ruiz/DWT2D@master#egg=DWT2D
+bm3d
 #jupyterlab
+#torch

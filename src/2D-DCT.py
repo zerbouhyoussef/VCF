@@ -45,6 +45,12 @@ parser.parser_decode.add_argument("-p", "--perceptual_quantization", action='sto
 parser.parser_decode.add_argument("-x", "--disable_subbands", action='store_true', help=f"Disable the coefficients reordering in subbands (default: \"{disable_subbands}\")", default=disable_subbands)
 
 args = parser.parser.parse_known_args()[0]
+#try:
+#    print("-> Denoising filter =", args.filter) # Don't delete this !
+#    denoiser = importlib.import_module(args.filter)
+#except AttributeError:
+#    # Remember that the filter is only active when decoding, and the import
+#    denoiser = importlib.import_module("no_filter")
 CT = importlib.import_module(args.color_transform)
 
 class CoDec(CT.CoDec):
@@ -259,12 +265,15 @@ class CoDec(CT.CoDec):
 
         return unpadded_img
 
-    def encode(self):
+    def encode_fn(self, in_fn, out_fn):
         logging.debug("trace")
+        logging.debug(f"in_fn = {in_fn}")
+        logging.debug(f"out_fn = {out_fn}")
+        
         #
         # Read the image.
         #
-        img = self.encode_read().astype(np.float32)
+        img = self.encode_read_fn(in_fn).astype(np.float32)
 
         #
         # Images must have a size multiple of 8.
@@ -273,12 +282,12 @@ class CoDec(CT.CoDec):
         padded_img = self.pad_and_center_to_multiple_of_block_size(img)
         if padded_img.shape != img.shape:
             logging.debug(f"Padding image from dimensions {img.shape} to new dimensions: {padded_img.shape}")
-        with open(f"{self.args.encoded}_shape.bin", "wb") as file:
+        with open(f"{out_fn}_shape.bin", "wb") as file:
             file.write(struct.pack("iii", *self.original_shape))
         img = padded_img
 
         #
-        # Provides numperical stability to the DCT.
+        # Provides numerical stability to the DCT.
         #
         img -= self.offset
         logging.debug(f"Input to color-DCT with range [{np.min(img)}, {np.max(img)}]")
@@ -357,18 +366,24 @@ class CoDec(CT.CoDec):
         #
         # Write the code-stream.
         #
-        output_size = self.encode_write(decom_k)
+        output_size = self.encode_write_fn(decom_k, out_fn)
         #self.BPP = (self.total_output_size*8)/(img.shape[0]*img.shape[1])
         #return rate
         return output_size
 
-    def decode(self):
+    def encode(self, in_fn="/tmp/original.png", out_fn="/tmp/encoded"):
+        return self.encode_fn(in_fn, out_fn)
+
+    def decode_fn(self, in_fn, out_fn):
         logging.debug("trace")
+        logging.debug(f"in_fn = {in_fn}")
+        logging.debug(f"out_fn = {out_fn}")
+
         #
         # Read the code-stream.
         #
-        decom_k = self.decode_read()
-        with open(f"{self.args.encoded}_shape.bin", "rb") as file:
+        decom_k = self.decode_read_fn(in_fn)
+        with open(f"{in_fn}_shape.bin", "rb") as file:
             self.original_shape = struct.unpack("iii", file.read(12))
 
         #
@@ -443,12 +458,17 @@ class CoDec(CT.CoDec):
             if np.min(y) < 0:
                 logging.warning(f"y[{np.unravel_index(np.argmin(y),y.shape)}]={np.min(y)}")
 
+        y = CT.CoDec.filter(self, y)
+
         #
         # Write the image.
         #
         y = np.clip(y, 0, 255).astype(np.uint8)
-        output_size = self.decode_write(y)
+        output_size = self.decode_write_fn(y, out_fn)
         return output_size
+
+    def decode(self, in_fn="/tmp/encoded", out_fn="/tmp/decoded.png"):
+        return self.decode_fn(in_fn, out_fn)
 
     def quantize_decom(self, decom):
         logging.debug("trace")
