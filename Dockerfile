@@ -25,6 +25,6 @@ RUN /root/envs/VCF/bin/pip install --no-cache-dir --upgrade pip \
 
 COPY . .
 
-EXPOSE 8888
+EXPOSE 8888 80
 
 CMD ["/root/envs/VCF/bin/python", "-m", "jupyter", "lab", "--ip=0.0.0.0", "--port=8888", "--allow-root"]

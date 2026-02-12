@@ -95,6 +95,10 @@ parser.parser_encode.add_argument("--max_b_frames", type=int,
     default=10)
 parser.parser_encode.add_argument("--hierarchical", action="store_true",
     help="Use hierarchical B-frame structure")
+parser.parser_encode.add_argument("--lambda_rd", type=float,
+    help="Lagrange multiplier for RD optimization (default: 0.92*QSS). "
+         "Higher = favor rate, lower = favor distortion. 0 = pure SAD.",
+    default=None)
 
 # Decoder - add transform parameter
 parser.parser_decode.add_argument("-T", "--transform", type=str,
@@ -125,12 +129,32 @@ def compute_sad(block1: np.ndarray, block2: np.ndarray) -> float:
     """Compute Sum of Absolute Differences between two blocks."""
     return float(np.sum(np.abs(block1.astype(np.int16) - block2.astype(np.int16))))
 
+def estimate_mv_bits(dx: int, dy: int) -> float:
+    """Estimate bits to encode a motion vector using Exp-Golomb-like model.
+    
+    Each component costs  2·floor(log2(|v| + 1)) + 1  bits.
+    Zero MV = 2 bits total (cheapest), large MV = expensive.
+    """
+    def _component_bits(v):
+        return 2.0 * math.floor(math.log2(abs(v) + 1)) + 1.0
+    return _component_bits(dx) + _component_bits(dy)
+
+# Bits to signal prediction mode in a B-frame block:
+#   fwd-only or bwd-only = 2 bits  (1 bit skip-bi + 1 bit direction)
+#   bidirectional        = 3 bits  (1 bit skip-bi + 2 MVs flag)
+MODE_BITS = {0: 2.0, 1: 2.0, 2: 3.0}
+
 # =============================================================================
 # Motion Estimation
 # =============================================================================
 
-def _diamond_search(ref_frame, curr_block, i, j, bs, sr=32):
-    """Diamond search pattern for motion estimation."""
+def _diamond_search(ref_frame, curr_block, i, j, bs, sr=32, lmbda=0.0):
+    """Diamond search pattern for motion estimation with RD cost.
+    
+    Minimises  J = SAD + λ · estimate_mv_bits(dx, dy).
+    Returns (best_mv, best_sad)  — the raw SAD of the winner
+    so callers can still use it for further mode decisions.
+    """
     h, w = ref_frame.shape[:2]
     
     # Large diamond pattern
@@ -141,26 +165,31 @@ def _diamond_search(ref_frame, curr_block, i, j, bs, sr=32):
     cx, cy = j, i
     best_mv = (0, 0)
     best_sad = float('inf')
+    best_cost = float('inf')
     
-    # Evaluate center position
+    # Evaluate center position (MV = (0,0), cheapest rate)
     if 0 <= cy and cy + bs <= h and 0 <= cx and cx + bs <= w:
         best_sad = compute_sad(curr_block, ref_frame[cy:cy+bs, cx:cx+bs])
+        best_cost = best_sad + lmbda * estimate_mv_bits(0, 0)
     
     # Large diamond search
     improved = True
     while improved:
         improved = False
-        for dx, dy in ldp:
-            ry, rx = cy + dy, cx + dx
+        for ddx, ddy in ldp:
+            ry, rx = cy + ddy, cx + ddx
             if (ry < 0 or ry + bs > h or rx < 0 or rx + bs > w or
                 abs(rx - j) > sr or abs(ry - i) > sr):
                 continue
             
             sad = compute_sad(curr_block, ref_frame[ry:ry+bs, rx:rx+bs])
+            mv_dx, mv_dy = rx - j, ry - i
+            cost = sad + lmbda * estimate_mv_bits(mv_dx, mv_dy)
             
-            if sad < best_sad:
+            if cost < best_cost:
                 best_sad = sad
-                best_mv = (rx - j, ry - i)
+                best_cost = cost
+                best_mv = (mv_dx, mv_dy)
                 cx, cy = rx, ry
                 improved = True
     
@@ -168,54 +197,63 @@ def _diamond_search(ref_frame, curr_block, i, j, bs, sr=32):
     improved = True
     while improved:
         improved = False
-        for dx, dy in sdp:
-            ry, rx = cy + dy, cx + dx
+        for ddx, ddy in sdp:
+            ry, rx = cy + ddy, cx + ddx
             if (ry < 0 or ry + bs > h or rx < 0 or rx + bs > w or
                 abs(rx - j) > sr or abs(ry - i) > sr):
                 continue
             
             sad = compute_sad(curr_block, ref_frame[ry:ry+bs, rx:rx+bs])
+            mv_dx, mv_dy = rx - j, ry - i
+            cost = sad + lmbda * estimate_mv_bits(mv_dx, mv_dy)
             
-            if sad < best_sad:
+            if cost < best_cost:
                 best_sad = sad
-                best_mv = (rx - j, ry - i)
+                best_cost = cost
+                best_mv = (mv_dx, mv_dy)
                 cx, cy = rx, ry
                 improved = True
     
     return best_mv, best_sad
 
-def _exhaustive_search(ref_frame, curr_block, i, j, bs, sr=32):
-    """Exhaustive search for motion estimation."""
+def _exhaustive_search(ref_frame, curr_block, i, j, bs, sr=32, lmbda=0.0):
+    """Exhaustive search for motion estimation with RD cost.
+    
+    Minimises  J = SAD + λ · estimate_mv_bits(dx, dy).
+    """
     h, w = ref_frame.shape[:2]
     best_mv = (0, 0)
     best_sad = float('inf')
+    best_cost = float('inf')
     
     for dy in range(-sr, sr + 1):
         for dx in range(-sr, sr + 1):
             ry, rx = i + dy, j + dx
             if 0 <= ry and ry + bs <= h and 0 <= rx and rx + bs <= w:
                 sad = compute_sad(curr_block, ref_frame[ry:ry+bs, rx:rx+bs])
+                cost = sad + lmbda * estimate_mv_bits(dx, dy)
                 
-                if sad < best_sad:
+                if cost < best_cost:
                     best_sad = sad
+                    best_cost = cost
                     best_mv = (dx, dy)
     
     return best_mv, best_sad
 
 def _process_block(args_tuple):
     """Process a single block for motion estimation (for parallel execution)."""
-    ref, curr_block, i, j, bs, sr, fast = args_tuple
+    ref, curr_block, i, j, bs, sr, fast, lmbda = args_tuple
     
     if fast:
-        mv, sad = _diamond_search(ref, curr_block, i, j, bs, sr)
+        mv, sad = _diamond_search(ref, curr_block, i, j, bs, sr, lmbda)
     else:
-        mv, sad = _exhaustive_search(ref, curr_block, i, j, bs, sr)
+        mv, sad = _exhaustive_search(ref, curr_block, i, j, bs, sr, lmbda)
     
     return mv, sad
 
 def _process_row(args_tuple):
     """Process one row of blocks for motion estimation."""
-    ref, curr, i, bs, sr, w, fast = args_tuple
+    ref, curr, i, bs, sr, w, fast, lmbda = args_tuple
     mvs = []
     sads = []
     
@@ -223,17 +261,20 @@ def _process_row(args_tuple):
         block = curr[i:i+bs, j:j+bs]
         
         if fast:
-            mv, sad = _diamond_search(ref, block, i, j, bs, sr)
+            mv, sad = _diamond_search(ref, block, i, j, bs, sr, lmbda)
         else:
-            mv, sad = _exhaustive_search(ref, block, i, j, bs, sr)
+            mv, sad = _exhaustive_search(ref, block, i, j, bs, sr, lmbda)
         
         mvs.append(mv)
         sads.append(sad)
     
     return mvs, sads
 
-def block_matching(ref_frame, curr_frame, bs=16, sr=32, fast=True):
-    """Block-based motion estimation with multiprocessing support."""
+def block_matching(ref_frame, curr_frame, bs=16, sr=32, fast=True, lmbda=0.0):
+    """Block-based motion estimation with RD-optimised MV selection.
+    
+    Each block minimises  J = SAD + λ · R_mv  instead of pure SAD.
+    """
     ref_gray = cv2.cvtColor(ref_frame, cv2.COLOR_RGB2GRAY)
     curr_gray = cv2.cvtColor(curr_frame, cv2.COLOR_RGB2GRAY)
     h, w = ref_gray.shape
@@ -252,7 +293,7 @@ def block_matching(ref_frame, curr_frame, bs=16, sr=32, fast=True):
         for i in range(0, h - bs + 1, bs):
             for j in range(0, w - bs + 1, bs):
                 block = curr_gray[i:i+bs, j:j+bs]
-                block_args.append((ref_gray, block, i, j, bs, sr, fast))
+                block_args.append((ref_gray, block, i, j, bs, sr, fast, lmbda))
         
         # Process blocks in parallel
         with Pool(processes=mp.cpu_count()) as pool:
@@ -266,7 +307,7 @@ def block_matching(ref_frame, curr_frame, bs=16, sr=32, fast=True):
                 idx += 1
     else:
         # Fast search or small search range - use threading (row-based)
-        row_args = [(ref_gray, curr_gray, i, bs, sr, w, fast) 
+        row_args = [(ref_gray, curr_gray, i, bs, sr, w, fast, lmbda) 
                     for i in range(0, h - bs + 1, bs)]
         
         with ThreadPoolExecutor(max_workers=max(1, mp.cpu_count() - 1)) as ex:
@@ -283,26 +324,29 @@ def block_matching(ref_frame, curr_frame, bs=16, sr=32, fast=True):
 # =============================================================================
 
 def _process_bidir_block(args_tuple):
-    """Process bidirectional ME for a single block (for parallel execution)."""
-    past_gray, future_gray, curr_block, i, j, bs, sr, fast, h = args_tuple
+    """Process bidirectional ME for a single block with RD-optimised mode decision.
+    
+    Mode decision minimises  J = SAD + λ · (mv_bits + mode_bits).
+    """
+    past_gray, future_gray, curr_block, i, j, bs, sr, fast, h, w, lmbda = args_tuple
     
     # Forward prediction (from past)
     if fast:
-        mv_fwd, sad_fwd = _diamond_search(past_gray, curr_block, i, j, bs, sr)
+        mv_fwd, sad_fwd = _diamond_search(past_gray, curr_block, i, j, bs, sr, lmbda)
     else:
-        mv_fwd, sad_fwd = _exhaustive_search(past_gray, curr_block, i, j, bs, sr)
+        mv_fwd, sad_fwd = _exhaustive_search(past_gray, curr_block, i, j, bs, sr, lmbda)
     
     # Backward prediction (from future)
     if fast:
-        mv_bwd, sad_bwd = _diamond_search(future_gray, curr_block, i, j, bs, sr)
+        mv_bwd, sad_bwd = _diamond_search(future_gray, curr_block, i, j, bs, sr, lmbda)
     else:
-        mv_bwd, sad_bwd = _exhaustive_search(future_gray, curr_block, i, j, bs, sr)
+        mv_bwd, sad_bwd = _exhaustive_search(future_gray, curr_block, i, j, bs, sr, lmbda)
     
-    # Bidirectional (average of both)
+    # Bidirectional (average of both predictions)
     ry_fwd = max(0, min(i + int(mv_fwd[1]), h - bs))
-    rx_fwd = max(0, min(j + int(mv_fwd[0]), h - bs))
+    rx_fwd = max(0, min(j + int(mv_fwd[0]), w - bs))
     ry_bwd = max(0, min(i + int(mv_bwd[1]), h - bs))
-    rx_bwd = max(0, min(j + int(mv_bwd[0]), h - bs))
+    rx_bwd = max(0, min(j + int(mv_bwd[0]), w - bs))
     
     pred_fwd = past_gray[ry_fwd:ry_fwd+bs, rx_fwd:rx_fwd+bs]
     pred_bwd = future_gray[ry_bwd:ry_bwd+bs, rx_bwd:rx_bwd+bs]
@@ -310,12 +354,17 @@ def _process_bidir_block(args_tuple):
     
     sad_bi = compute_sad(curr_block, pred_bi)
     
-    # Choose best mode based on SAD
-    if sad_fwd <= sad_bwd and sad_fwd <= sad_bi:
+    # RD cost for each mode:  J = SAD + λ · (mv_bits + mode_bits)
+    cost_fwd = sad_fwd + lmbda * (estimate_mv_bits(*mv_fwd) + MODE_BITS[0])
+    cost_bwd = sad_bwd + lmbda * (estimate_mv_bits(*mv_bwd) + MODE_BITS[1])
+    cost_bi  = sad_bi  + lmbda * (estimate_mv_bits(*mv_fwd) + estimate_mv_bits(*mv_bwd) + MODE_BITS[2])
+    
+    # Choose best mode based on RD cost
+    if cost_fwd <= cost_bwd and cost_fwd <= cost_bi:
         mode = 0  # Forward
         mv_f = mv_fwd
         mv_b = (0, 0)
-    elif sad_bwd <= sad_bi:
+    elif cost_bwd <= cost_bi:
         mode = 1  # Backward
         mv_f = (0, 0)
         mv_b = mv_bwd
@@ -326,9 +375,12 @@ def _process_bidir_block(args_tuple):
     
     return mv_f, mv_b, mode
 
-def bidirectional_me(ref_past, ref_future, curr_frame, bs=16, sr=32, fast=True):
+def bidirectional_me(ref_past, ref_future, curr_frame, bs=16, sr=32, fast=True, lmbda=0.0):
     """
-    Bidirectional motion estimation for B-frames with multiprocessing support.
+    Bidirectional motion estimation for B-frames with RD-optimised mode decision.
+    
+    MV selection minimises  J = SAD + λ · R_mv.
+    Mode decision minimises  J = SAD + λ · (R_mv + R_mode).
     Returns forward MV, backward MV, and best mode (forward/backward/bi).
     """
     h, w = curr_frame.shape[:2]
@@ -352,7 +404,7 @@ def bidirectional_me(ref_past, ref_future, curr_frame, bs=16, sr=32, fast=True):
         for i in range(0, h - bs + 1, bs):
             for j in range(0, w - bs + 1, bs):
                 curr_block = curr_gray[i:i+bs, j:j+bs]
-                block_args.append((past_gray, future_gray, curr_block, i, j, bs, sr, fast, h))
+                block_args.append((past_gray, future_gray, curr_block, i, j, bs, sr, fast, h, w, lmbda))
         
         # Process blocks in parallel
         with Pool(processes=mp.cpu_count()) as pool:
@@ -374,15 +426,15 @@ def bidirectional_me(ref_past, ref_future, curr_frame, bs=16, sr=32, fast=True):
                 
                 # Forward prediction (from past)
                 if fast:
-                    mv_fwd, sad_fwd = _diamond_search(past_gray, curr_block, i, j, bs, sr)
+                    mv_fwd, sad_fwd = _diamond_search(past_gray, curr_block, i, j, bs, sr, lmbda)
                 else:
-                    mv_fwd, sad_fwd = _exhaustive_search(past_gray, curr_block, i, j, bs, sr)
+                    mv_fwd, sad_fwd = _exhaustive_search(past_gray, curr_block, i, j, bs, sr, lmbda)
                 
                 # Backward prediction (from future)
                 if fast:
-                    mv_bwd, sad_bwd = _diamond_search(future_gray, curr_block, i, j, bs, sr)
+                    mv_bwd, sad_bwd = _diamond_search(future_gray, curr_block, i, j, bs, sr, lmbda)
                 else:
-                    mv_bwd, sad_bwd = _exhaustive_search(future_gray, curr_block, i, j, bs, sr)
+                    mv_bwd, sad_bwd = _exhaustive_search(future_gray, curr_block, i, j, bs, sr, lmbda)
                 
                 # Bidirectional (average of both)
                 ry_fwd = max(0, min(i + int(mv_fwd[1]), h - bs))
@@ -396,13 +448,18 @@ def bidirectional_me(ref_past, ref_future, curr_frame, bs=16, sr=32, fast=True):
                 
                 sad_bi = compute_sad(curr_block, pred_bi)
                 
-                # Choose best mode based on SAD
+                # RD cost for each mode:  J = SAD + λ · (mv_bits + mode_bits)
+                cost_fwd = sad_fwd + lmbda * (estimate_mv_bits(*mv_fwd) + MODE_BITS[0])
+                cost_bwd = sad_bwd + lmbda * (estimate_mv_bits(*mv_bwd) + MODE_BITS[1])
+                cost_bi  = sad_bi  + lmbda * (estimate_mv_bits(*mv_fwd) + estimate_mv_bits(*mv_bwd) + MODE_BITS[2])
+                
+                # Choose best mode based on RD cost
                 ri, ci = i // bs, j // bs
-                if sad_fwd <= sad_bwd and sad_fwd <= sad_bi:
+                if cost_fwd <= cost_bwd and cost_fwd <= cost_bi:
                     mode[ri, ci] = 0  # Forward
                     mv_forward[ri, ci] = mv_fwd
                     mv_backward[ri, ci] = (0, 0)
-                elif sad_bwd <= sad_bi:
+                elif cost_bwd <= cost_bi:
                     mode[ri, ci] = 1  # Backward
                     mv_forward[ri, ci] = (0, 0)
                     mv_backward[ri, ci] = mv_bwd
@@ -622,6 +679,8 @@ class CoDec(EVC.CoDec):
         
         # Monkey-patch transform codec methods to use self.args when called without arguments
         # This fixes VCF framework's encode()/decode() which call these without args
+        # Also capture decoded output in case decode_write fails to persist to disk
+        self._captured_decode_output = [None]
         original_encode_read = self.transform_codec.encode_read
         original_encode_write = self.transform_codec.encode_write
         original_decode_read = self.transform_codec.decode_read
@@ -645,6 +704,7 @@ class CoDec(EVC.CoDec):
         def patched_decode_write(img, fn=None):
             if fn is None:
                 fn = self.transform_codec.args.decoded
+            self._captured_decode_output[0] = np.array(img, copy=True)
             return original_decode_write(img, fn)
         
         self.transform_codec.encode_read = patched_encode_read
@@ -665,9 +725,24 @@ class CoDec(EVC.CoDec):
             logging.warning(f"max_b_frames={self.max_b_frames} is too low, setting to 10")
             self.max_b_frames = 10
         
+        # Where original frames are expected for metrics
+        self.original_prefix = getattr(args, "original_prefix",
+                                       os.path.join(tempfile.gettempdir(), "encoded_original"))
+        
+        # RD-optimization: λ controls the rate-distortion trade-off
+        #   J = SAD + λ · R   (λ=0 ⟹ pure SAD, higher λ ⟹ favor cheaper MVs)
+        # Default: √0.85 · QSS ≈ 0.92·QSS  (H.264 SAD-λ relationship)
+        user_lambda = getattr(args, 'lambda_rd', None)
+        if user_lambda is not None:
+            self.lambda_rd = float(user_lambda)
+        else:
+            qss = float(getattr(args, 'QSS', 1))
+            self.lambda_rd = math.sqrt(0.85) * qss
+        
         logging.info(f"MCTF Config: GOP={self.gop_size}, NumGOPs={self.num_gops}, MaxB={self.max_b_frames}, "
                     f"BlockSize={self.block_size}, SearchRange={self.search_range}, "
-                    f"Fast={self.fast}, Hierarchical={self.hierarchical}")
+                    f"Fast={self.fast}, Hierarchical={self.hierarchical}, "
+                    f"λ_RD={self.lambda_rd:.4f}")
 
     def bye(self):
         """Override parent's bye() to prevent double video encoding."""
@@ -805,6 +880,15 @@ class CoDec(EVC.CoDec):
         logging.info(f"The decoded MP4 is for playback only and uses H.264 re-encoding.")
         logging.info(f"{'='*60}\n")
         
+        # Persist metadata so decode() is self-contained
+        with open(f"{self.args.encoded}_meta.txt", "w") as f:
+            f.write(f"{self.original_prefix}\n")
+            f.write(f"{self.N_frames}\n")
+            f.write(f"{self.height}\n")
+            f.write(f"{self.width}\n")
+            f.write(f"{BPP}\n")
+            f.write(f"{self.total_output_size}\n")
+        
         return self.total_output_size
 
     def _encode_i_frame(self, frame, idx, decoded_frames):
@@ -850,6 +934,7 @@ class CoDec(EVC.CoDec):
         
         self.transform_codec.args.encoded = i_enc_fn
         self.transform_codec.args.decoded = dec_fn
+        self._captured_decode_output[0] = None
         self.transform_codec.decode()
         
         if saved_encoded is not None:
@@ -857,7 +942,16 @@ class CoDec(EVC.CoDec):
         if saved_decoded is not None:
             self.transform_codec.args.decoded = saved_decoded
         
-        decoded_frames[idx] = np.array(Image.open(dec_fn).convert("RGB"))
+        # Use captured output if available (avoids FileNotFoundError when decode_write path differs)
+        if self._captured_decode_output[0] is not None:
+            decoded_frames[idx] = self._captured_decode_output[0]
+        elif os.path.exists(dec_fn):
+            decoded_frames[idx] = np.array(Image.open(dec_fn).convert("RGB"))
+        else:
+            raise FileNotFoundError(
+                f"Decoded frame not found at {dec_fn}. "
+                "The transform codec's decode() did not write the expected output."
+            )
         
         logging.info(f"  I-frame {idx}: {O_bytes} bytes")
 
@@ -867,29 +961,32 @@ class CoDec(EVC.CoDec):
         
         ref_frame = decoded_frames[ref_idx]
         
-        # Motion estimation
+        # Motion estimation (RD-optimised: J = SAD + λ·R_mv)
         mv_field = block_matching(
             ref_frame, frame, 
             self.block_size, self.search_range, 
-            self.fast
+            self.fast, self.lambda_rd
         )
         
         # Motion compensation
         pred = motion_compensate(ref_frame, mv_field, self.block_size)
         
-        # Compute residual
+        # Compute residual and map to [0, 255] without hard-clipping:
+        # residual ∈ [-255, 255] → /2 + 128 → [0.5, 255.5] → round → [0, 255]
+        # Max rounding error from mapping: ±1 per sample (vs up to ±128 with old +128 clip)
         residual = frame.astype(np.int16) - pred.astype(np.int16)
-        residual_img = np.clip(residual + 128, 0, 255).astype(np.uint8)
+        residual_img = np.clip(np.round(residual.astype(np.float32) / 2 + 128), 0, 255).astype(np.uint8)
         
-        # Save residual as PNG and encode using transform codec
-        residual_fn = f"{getattr(self.args, 'decoded', '/tmp/decoded')}_residual_{idx:04d}.png"
+        # Save residual as PNG and encode using transform codec (DCT + quantize + entropy)
+        residual_fn = f"{self.args.encoded}_res_{idx:04d}.png"
         Image.fromarray(residual_img).save(residual_fn)
+        
+        enc_fn = f"{self.args.encoded}_{idx:04d}"
         
         # Temporarily set args
         saved_original = getattr(self.transform_codec.args, 'original', None)
         saved_encoded = getattr(self.transform_codec.args, 'encoded', None)
         
-        enc_fn = f"{self.args.encoded}_{idx:04d}"
         self.transform_codec.args.original = residual_fn
         self.transform_codec.args.encoded = enc_fn
         
@@ -922,19 +1019,30 @@ class CoDec(EVC.CoDec):
         with open(f"{enc_fn}_type.txt", 'w') as f:
             f.write(f"P:{ref_idx}")
         
-        # Decode to get reconstruction
+        # Decode residual to get reconstruction (encoder-side decode for reference)
         dec_fn = f"{self.args.encoded}_dec_{idx:04d}.png"
         saved_encoded = getattr(self.transform_codec.args, 'encoded', None)
         saved_decoded = getattr(self.transform_codec.args, 'decoded', None)
         
         self.transform_codec.args.encoded = enc_fn
         self.transform_codec.args.decoded = dec_fn
+        self._captured_decode_output[0] = None
         self.transform_codec.decode()
         
         self.transform_codec.args.encoded = saved_encoded
         self.transform_codec.args.decoded = saved_decoded
         
-        residual_rec = np.array(Image.open(dec_fn).convert("RGB")).astype(np.int16) - 128
+        # Undo mapping: (pixel - 128) * 2; use captured output if available
+        if self._captured_decode_output[0] is not None:
+            residual_img_dec = self._captured_decode_output[0]
+        elif os.path.exists(dec_fn):
+            residual_img_dec = np.array(Image.open(dec_fn).convert("RGB"))
+        else:
+            raise FileNotFoundError(
+                f"Decoded residual not found at {dec_fn}. "
+                "The transform codec's decode() did not write the expected output."
+            )
+        residual_rec = (residual_img_dec.astype(np.int16) - 128) * 2
         
         # Reconstruct and cache
         recon = np.clip(pred.astype(np.int16) + residual_rec, 0, 255).astype(np.uint8)
@@ -949,11 +1057,11 @@ class CoDec(EVC.CoDec):
         ref_past = decoded_frames[ref_past_idx]
         ref_future = decoded_frames[ref_future_idx]
         
-        # Bidirectional motion estimation
+        # Bidirectional motion estimation (RD-optimised: J = SAD + λ·(R_mv + R_mode))
         mv_fwd, mv_bwd, mode = bidirectional_me(
             ref_past, ref_future, frame,
             self.block_size, self.search_range,
-            self.fast
+            self.fast, self.lambda_rd
         )
         
         # Motion compensation
@@ -961,19 +1069,21 @@ class CoDec(EVC.CoDec):
             ref_past, ref_future, mv_fwd, mv_bwd, mode, self.block_size
         )
         
-        # Compute residual
+        # Compute residual and map to [0, 255] without hard-clipping:
+        # residual ∈ [-255, 255] → /2 + 128 → [0.5, 255.5] → round → [0, 255]
         residual = frame.astype(np.int16) - pred.astype(np.int16)
-        residual_img = np.clip(residual + 128, 0, 255).astype(np.uint8)
+        residual_img = np.clip(np.round(residual.astype(np.float32) / 2 + 128), 0, 255).astype(np.uint8)
         
-        # Save residual as PNG and encode using transform codec
-        residual_fn = f"{getattr(self.args, 'decoded', '/tmp/decoded')}_residual_{idx:04d}.png"
+        # Save residual as PNG and encode using transform codec (DCT + quantize + entropy)
+        residual_fn = f"{self.args.encoded}_res_{idx:04d}.png"
         Image.fromarray(residual_img).save(residual_fn)
         
-        # Temporarily set args
-        saved_original = self.transform_codec.args.original
-        saved_encoded = self.transform_codec.args.encoded
-        
         enc_fn = f"{self.args.encoded}_{idx:04d}"
+        
+        # Temporarily set args
+        saved_original = getattr(self.transform_codec.args, 'original', None)
+        saved_encoded = getattr(self.transform_codec.args, 'encoded', None)
+        
         self.transform_codec.args.original = residual_fn
         self.transform_codec.args.encoded = enc_fn
         
@@ -986,8 +1096,10 @@ class CoDec(EVC.CoDec):
         O_bytes = self.transform_codec.encode()
         
         # Restore args
-        self.transform_codec.args.original = saved_original
-        self.transform_codec.args.encoded = saved_encoded
+        if saved_original is not None:
+            self.transform_codec.args.original = saved_original
+        if saved_encoded is not None:
+            self.transform_codec.args.encoded = saved_encoded
         
         self.total_output_size += O_bytes
         
@@ -1007,12 +1119,30 @@ class CoDec(EVC.CoDec):
         with open(f"{enc_fn}_type.txt", 'w') as f:
             f.write(f"B:{ref_past_idx},{ref_future_idx}")
         
-        # Decode to get reconstruction
+        # Decode residual to get reconstruction (encoder-side decode for reference)
         dec_fn = f"{self.args.encoded}_dec_{idx:04d}.png"
-        compressed_img = self.transform_codec.decode_read(enc_fn)
-        img = self.transform_codec.decompress(compressed_img)
-        self.transform_codec.decode_write(img, dec_fn)
-        residual_rec = np.array(Image.open(dec_fn).convert("RGB")).astype(np.int16) - 128
+        saved_encoded = getattr(self.transform_codec.args, 'encoded', None)
+        saved_decoded = getattr(self.transform_codec.args, 'decoded', None)
+        
+        self.transform_codec.args.encoded = enc_fn
+        self.transform_codec.args.decoded = dec_fn
+        self._captured_decode_output[0] = None
+        self.transform_codec.decode()
+        
+        self.transform_codec.args.encoded = saved_encoded
+        self.transform_codec.args.decoded = saved_decoded
+        
+        # Undo mapping: (pixel - 128) * 2; use captured output if available
+        if self._captured_decode_output[0] is not None:
+            residual_img_dec = self._captured_decode_output[0]
+        elif os.path.exists(dec_fn):
+            residual_img_dec = np.array(Image.open(dec_fn).convert("RGB"))
+        else:
+            raise FileNotFoundError(
+                f"Decoded residual not found at {dec_fn}. "
+                "The transform codec's decode() did not write the expected output."
+            )
+        residual_rec = (residual_img_dec.astype(np.int16) - 128) * 2
         
         # Reconstruct and cache
         recon = np.clip(pred.astype(np.int16) + residual_rec, 0, 255).astype(np.uint8)
@@ -1025,6 +1155,19 @@ class CoDec(EVC.CoDec):
     def decode(self):
         """Decode MCTF encoded video."""
         logging.debug("trace")
+        
+        # Read encoding metadata if available (makes decode self-contained)
+        meta = f"{self.args.encoded}_meta.txt"
+        if os.path.exists(meta):
+            with open(meta, "r") as f:
+                self.original_prefix = f.readline().strip()
+                self.N_frames = int(f.readline().strip())
+                self.height = int(f.readline().strip())
+                self.width = int(f.readline().strip())
+                self._meta_BPP = float(f.readline().strip())
+                line = f.readline().strip()
+                if line:
+                    self.total_output_size = int(line)
         
         # First, scan all frames to determine decoding order
         frame_info = {}
@@ -1104,6 +1247,16 @@ class CoDec(EVC.CoDec):
         logging.info(f"{'='*60}")
         logging.info(f"Total frames decoded: {len(decoded_frames)}")
         
+        # Write all decoded frames to disk with consistent naming
+        # (guarantees files exist at the expected paths for RMSE and ffmpeg)
+        decoded_prefix = getattr(self.args, 'decoded', '/tmp/decoded')
+        if decoded_prefix.endswith('.png'):
+            decoded_prefix = decoded_prefix[:-4]
+        for idx in range(len(decoded_frames)):
+            out_fn = f"{decoded_prefix}_{idx:04d}.png"
+            Image.fromarray(decoded_frames[idx]).save(out_fn)
+        logging.info(f"Wrote {len(decoded_frames)} frames to {decoded_prefix}_XXXX.png")
+        
         # Calculate quality metrics (RMSE) if original frames are available
         try:
             from information_theory import distortion
@@ -1113,7 +1266,7 @@ class CoDec(EVC.CoDec):
             
             for idx in range(len(decoded_frames)):
                 original_fn = f"{self.original_prefix}_{idx:04d}.png"
-                decoded_fn = f"{self.args.encoded}_{idx:04d}.png"
+                decoded_fn = f"{decoded_prefix}_{idx:04d}.png"
                 
                 if os.path.exists(original_fn) and os.path.exists(decoded_fn):
                     original_img = np.array(Image.open(original_fn).convert("RGB"))
@@ -1129,33 +1282,27 @@ class CoDec(EVC.CoDec):
             if frames_compared > 0:
                 avg_RMSE = total_RMSE / frames_compared
                 
-                # Calculate BPP from encoding
-                if hasattr(self, 'total_output_size') and hasattr(self, 'width') and hasattr(self, 'height'):
+                # Calculate BPP from encoding metadata
+                BPP = 0
+                if hasattr(self, 'total_output_size') and self.total_output_size > 0 and hasattr(self, 'width') and hasattr(self, 'height'):
                     total_pixels = frames_compared * self.width * self.height
                     BPP = (self.total_output_size * 8) / total_pixels
+                elif hasattr(self, '_meta_BPP') and self._meta_BPP > 0:
+                    BPP = self._meta_BPP
                 else:
-                    # Try to read from encoding metadata
-                    try:
-                        with open(f"{self.args.encoded}.txt", 'r') as f:
-                            f.readline()  # original file
-                            N_frames = int(f.readline().strip())
-                            height = int(f.readline().strip())
-                            width = int(f.readline().strip())
-                            BPP = float(f.readline().strip())
-                    except:
-                        BPP = 0
-                        logging.warning("Could not read encoding metadata for BPP calculation")
+                    logging.warning("Could not determine BPP from encoding metadata")
                 
-                J = BPP + avg_RMSE
+                lrd = getattr(self, 'lambda_rd', 1.0)
+                J = avg_RMSE + lrd * BPP
                 
                 logging.info(f"\n{'='*60}")
                 logging.info(f"QUALITY METRICS")
                 logging.info(f"{'='*60}")
                 logging.info(f"Frames compared: {frames_compared}")
-                logging.info(f"Average RMSE: {avg_RMSE:.6f}")
+                logging.info(f"Average RMSE (D): {avg_RMSE:.6f}")
                 logging.info(f"Bits Per Pixel (R): {BPP:.6f}")
-                logging.info(f"Distortion (D): {avg_RMSE:.6f}")
-                logging.info(f"Rate-Distortion Cost (J = R + D): {J:.6f}")
+                logging.info(f"λ (lambda_rd): {lrd:.4f}")
+                logging.info(f"Rate-Distortion Cost (J = D + λ·R): {J:.6f}")
                 logging.info(f"{'='*60}\n")
         
         except ImportError:
@@ -1169,17 +1316,19 @@ class CoDec(EVC.CoDec):
         # Use ffmpeg to combine frames with optimized settings
         import subprocess
         try:
-            # Build ffmpeg command with compression settings
-            # Strip .png extension if present to avoid decoded.png.mp4
-            decoded_path = getattr(self.args, "decoded", "/tmp/decoded")
-            if decoded_path.endswith('.png'):
-                decoded_path = decoded_path[:-4]
+            # Verify decoded frames actually exist before calling ffmpeg
+            first_frame = f"{decoded_prefix}_0000.png"
+            logging.info(f"Decoded prefix: {decoded_prefix}")
+            logging.info(f"First frame exists? {os.path.exists(first_frame)}")
+            if not os.path.exists(first_frame):
+                logging.error(f"Cannot create video: first decoded frame not found at {first_frame}")
+                return 0
             
-            output_mp4 = f'{decoded_path}.mp4'
+            output_mp4 = f'{decoded_prefix}.mp4'
             cmd = [
                 'ffmpeg', '-y',
                 '-framerate', '30',
-                '-i', f'{decoded_path}_%04d.png',
+                '-i', f'{decoded_prefix}_%04d.png',
                 '-c:v', 'libx264',
                 '-crf', '18',  # Near-lossless quality (0=lossless, 51=worst, 18=visually lossless)
                 '-preset', 'medium',  # Encoding speed (slower = better compression)
@@ -1205,23 +1354,17 @@ class CoDec(EVC.CoDec):
                     if ratio > 2:
                         logging.warning(f"MP4 is {ratio:.2f}x larger than encoded data!")
                 else:
-                    # Try to read from encoding metadata
-                    try:
-                        with open(f"{self.args.encoded}.txt", 'r') as f:
-                            f.readline()  # original file
-                            N_frames = int(f.readline().strip())
-                            height = int(f.readline().strip())
-                            width = int(f.readline().strip())
-                            BPP = float(f.readline().strip())
-                            # Calculate encoded size from BPP
-                            total_pixels = N_frames * height * width
-                            encoded_size = int((BPP * total_pixels) / 8)
+                    # Try to use metadata loaded at start of decode()
+                    if hasattr(self, '_meta_BPP') and self._meta_BPP > 0 and hasattr(self, 'width') and hasattr(self, 'height') and hasattr(self, 'N_frames'):
+                        total_pixels = self.N_frames * self.height * self.width
+                        encoded_size = int((self._meta_BPP * total_pixels) / 8)
+                        if encoded_size > 0:
                             ratio = mp4_size / encoded_size
                             logging.info(f"Encoded data size: {encoded_size} bytes ({encoded_size/1024/1024:.2f} MB)")
                             logging.info(f"MP4 vs Encoded ratio: {ratio:.2f}x")
                             if ratio > 2:
                                 logging.info(f"NOTE: MP4 is {ratio:.2f}x larger - this is normal for H.264 re-encoding")
-                    except:
+                    else:
                         logging.debug("Could not calculate encoded size for comparison")
             
             # Show ffmpeg output if debugging
@@ -1260,14 +1403,14 @@ class CoDec(EVC.CoDec):
         """Decode P-frame using VCF transform."""
         logging.info(f"Decoding P-frame {idx} (ref={ref_idx})")
         
+        enc_fn = f"{self.args.encoded}_{idx:04d}"
+        
         # Load motion vectors
-        mv_fn = f"{self.args.encoded}_{idx:04d}_mv.npz"
-        mv_data = np.load(mv_fn)
+        mv_data = np.load(f"{enc_fn}_mv.npz")
         mv_field = mv_data['mv']
         
         # Decode residual using transform codec
-        enc_fn = f"{self.args.encoded}_{idx:04d}"
-        residual_fn = f"{getattr(self.args, 'decoded', '/tmp/decoded')}_residual_{idx:04d}.png"
+        residual_fn = f"{self.args.encoded}_dec_res_{idx:04d}.png"
         saved_encoded = self.transform_codec.args.encoded
         saved_decoded = self.transform_codec.args.decoded
         
@@ -1278,34 +1421,31 @@ class CoDec(EVC.CoDec):
         self.transform_codec.args.encoded = saved_encoded
         self.transform_codec.args.decoded = saved_decoded
         
-        # Load decoded residual
-        residual_img = np.array(Image.open(residual_fn).convert("RGB")).astype(np.int16) - 128
+        # Undo /2+128 mapping: (pixel - 128) * 2
+        residual = (np.array(Image.open(residual_fn).convert("RGB")).astype(np.int16) - 128) * 2
         
         # Motion compensation
         ref_frame = decoded_frames[ref_idx]
         pred = motion_compensate(ref_frame, mv_field, self.block_size)
         
         # Reconstruct
-        recon = np.clip(pred.astype(np.int16) + residual_img, 0, 255).astype(np.uint8)
-        
-        dec_fn = f"{getattr(self.args, 'decoded', '/tmp/decoded')}_{idx:04d}.png"
-        Image.fromarray(recon).save(dec_fn)
+        recon = np.clip(pred.astype(np.int16) + residual, 0, 255).astype(np.uint8)
         decoded_frames[idx] = recon
 
     def _decode_b_frame(self, idx, ref_past_idx, ref_future_idx, decoded_frames):
         """Decode B-frame using VCF transform."""
         logging.info(f"Decoding B-frame {idx} (refs={ref_past_idx},{ref_future_idx})")
         
+        enc_fn = f"{self.args.encoded}_{idx:04d}"
+        
         # Load motion vectors and mode
-        mv_fn = f"{self.args.encoded}_{idx:04d}_mv.npz"
-        mv_data = np.load(mv_fn)
+        mv_data = np.load(f"{enc_fn}_mv.npz")
         mv_fwd = mv_data['mv_fwd']
         mv_bwd = mv_data['mv_bwd']
         mode = mv_data['mode']
         
         # Decode residual using transform codec
-        enc_fn = f"{self.args.encoded}_{idx:04d}"
-        residual_fn = f"{getattr(self.args, 'decoded', '/tmp/decoded')}_residual_{idx:04d}.png"
+        residual_fn = f"{self.args.encoded}_dec_res_{idx:04d}.png"
         saved_encoded = self.transform_codec.args.encoded
         saved_decoded = self.transform_codec.args.decoded
         
@@ -1316,8 +1456,8 @@ class CoDec(EVC.CoDec):
         self.transform_codec.args.encoded = saved_encoded
         self.transform_codec.args.decoded = saved_decoded
         
-        # Load decoded residual
-        residual_img = np.array(Image.open(residual_fn).convert("RGB")).astype(np.int16) - 128
+        # Undo /2+128 mapping: (pixel - 128) * 2
+        residual = (np.array(Image.open(residual_fn).convert("RGB")).astype(np.int16) - 128) * 2
         
         # Motion compensation
         ref_past = decoded_frames[ref_past_idx]
@@ -1327,10 +1467,7 @@ class CoDec(EVC.CoDec):
         )
         
         # Reconstruct
-        recon = np.clip(pred.astype(np.int16) + residual_img, 0, 255).astype(np.uint8)
-        
-        dec_fn = f"{getattr(self.args, 'decoded', '/tmp/decoded')}_{idx:04d}.png"
-        Image.fromarray(recon).save(dec_fn)
+        recon = np.clip(pred.astype(np.int16) + residual, 0, 255).astype(np.uint8)
         decoded_frames[idx] = recon
 
 # =============================================================================
